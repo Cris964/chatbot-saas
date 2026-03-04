@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const FormData = require('form-data');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -13,7 +14,6 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Verificacion del webhook
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -26,7 +26,6 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// Recibir mensajes
 app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
@@ -37,14 +36,10 @@ app.post('/webhook', async (req, res) => {
     const message = changes?.value?.messages?.[0];
     const phoneNumberId = changes?.value?.metadata?.phone_number_id;
 
-    if (!message || message.type !== 'text') return res.sendStatus(200);
+    if (!message) return res.sendStatus(200);
 
-    const userMessage = message.text.body;
     const userPhone = message.from;
 
-    console.log('Mensaje de ' + userPhone + ': ' + userMessage);
-
-    // Buscar cliente por su phone_number_id
     const { data: client, error } = await supabase
       .from('clients')
       .select('*')
@@ -53,20 +48,46 @@ app.post('/webhook', async (req, res) => {
       .single();
 
     if (error || !client) {
-      console.log('Cliente no encontrado para phone_number_id: ' + phoneNumberId);
+      console.log('Cliente no encontrado para: ' + phoneNumberId);
       return res.sendStatus(200);
     }
 
-    // Obtener historial de conversacion
+    let userMessage = '';
+
+    // Manejar diferentes tipos de mensajes
+    if (message.type === 'text') {
+      userMessage = message.text.body;
+
+    } else if (message.type === 'audio') {
+      console.log('Audio recibido de ' + userPhone);
+      const audioUrl = await getMediaUrl(message.audio.id, client.whatsapp_token);
+      const transcription = await transcribeAudio(audioUrl, client.whatsapp_token);
+      userMessage = '[Nota de voz]: ' + transcription;
+
+    } else if (message.type === 'image') {
+      console.log('Imagen recibida de ' + userPhone);
+      const imageUrl = await getMediaUrl(message.image.id, client.whatsapp_token);
+      userMessage = '[El cliente envio una imagen: ' + imageUrl + '] Responde que recibiste la imagen y que la estas revisando, y si puedes identificar algo relevante para la venta, mencíonalo.';
+
+    } else if (message.type === 'document') {
+      userMessage = '[El cliente envio un documento] Responde que recibiste el documento y que lo revisaras pronto.';
+
+    } else {
+      return res.sendStatus(200);
+    }
+
+    console.log('Mensaje de ' + userPhone + ': ' + userMessage);
+
     const history = await getConversationHistory(client.id, userPhone);
-
-    // Llamar a la IA con el prompt del cliente
     const aiResponse = await getAIResponse(client, userMessage, history);
-
-    // Guardar el nuevo mensaje en el historial
     await saveMessage(client.id, userPhone, userMessage, aiResponse);
 
-    // Responder por WhatsApp
+    // Verificar si hay que enviar imagen de producto
+    const productImage = detectProductImage(aiResponse, client);
+    if (productImage) {
+      await sendWhatsAppImage(userPhone, productImage.url, productImage.caption, phoneNumberId, client.whatsapp_token);
+    }
+
     await sendWhatsAppMessage(userPhone, aiResponse, phoneNumberId, client.whatsapp_token);
 
     res.sendStatus(200);
@@ -76,7 +97,61 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Obtener historial de conversacion
+// Obtener URL de media de Meta
+async function getMediaUrl(mediaId, token) {
+  const response = await axios.get(
+    'https://graph.facebook.com/v18.0/' + mediaId,
+    { headers: { 'Authorization': 'Bearer ' + token } }
+  );
+  return response.data.url;
+}
+
+// Transcribir audio con Whisper via OpenRouter
+async function transcribeAudio(audioUrl, token) {
+  try {
+    const audioResponse = await axios.get(audioUrl, {
+      responseType: 'arraybuffer',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+
+    const formData = new FormData();
+    formData.append('file', Buffer.from(audioResponse.data), {
+      filename: 'audio.ogg',
+      contentType: 'audio/ogg'
+    });
+    formData.append('model', 'whisper-1');
+
+    const response = await axios.post(
+      'https://api.openai.com/v1/audio/transcriptions',
+      formData,
+      {
+        headers: {
+          'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
+          ...formData.getHeaders()
+        }
+      }
+    );
+    return response.data.text;
+  } catch (error) {
+    console.error('Error transcribiendo audio:', error.message);
+    return 'No pude entender el audio, por favor escribe tu mensaje.';
+  }
+}
+
+// Detectar si el bot menciona un producto y tiene imagen
+function detectProductImage(aiResponse, client) {
+  if (!client.product_images) return null;
+  try {
+    const images = JSON.parse(client.product_images);
+    for (const product of images) {
+      if (aiResponse.toLowerCase().includes(product.name.toLowerCase())) {
+        return product;
+      }
+    }
+  } catch { return null; }
+  return null;
+}
+
 async function getConversationHistory(clientId, userPhone) {
   try {
     const { data } = await supabase
@@ -91,7 +166,6 @@ async function getConversationHistory(clientId, userPhone) {
   }
 }
 
-// Guardar mensaje en historial
 async function saveMessage(clientId, userPhone, userMessage, aiResponse) {
   try {
     const { data: existing } = await supabase
@@ -128,12 +202,11 @@ async function saveMessage(clientId, userPhone, userMessage, aiResponse) {
     console.error('Error guardando mensaje:', error.message);
   }
 }
-// Llamar a la IA
+
 async function getAIResponse(client, userMessage, history) {
-  // Construir prompt completo con FAQ y catalogo si existen
   let systemPrompt = client.prompt;
   if (client.faq) systemPrompt += '\n\nPREGUNTAS FRECUENTES:\n' + client.faq;
-  if (client.catalog) systemPrompt += '\n\nCATALOGO O MENU:\n' + client.catalog;
+  if (client.catalog) systemPrompt += '\n\nCATALOGO:\n' + client.catalog;
 
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -154,7 +227,6 @@ async function getAIResponse(client, userMessage, history) {
   return response.data.choices[0].message.content;
 }
 
-// Enviar mensaje por WhatsApp
 async function sendWhatsAppMessage(to, message, phoneNumberId, token) {
   await axios.post(
     'https://graph.facebook.com/v18.0/' + phoneNumberId + '/messages',
@@ -164,12 +236,20 @@ async function sendWhatsAppMessage(to, message, phoneNumberId, token) {
       type: 'text',
       text: { body: message }
     },
+    { headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } }
+  );
+}
+
+async function sendWhatsAppImage(to, imageUrl, caption, phoneNumberId, token) {
+  await axios.post(
+    'https://graph.facebook.com/v18.0/' + phoneNumberId + '/messages',
     {
-      headers: {
-        'Authorization': 'Bearer ' + token,
-        'Content-Type': 'application/json'
-      }
-    }
+      messaging_product: 'whatsapp',
+      to: to,
+      type: 'image',
+      image: { link: imageUrl, caption: caption || '' }
+    },
+    { headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } }
   );
 }
 
