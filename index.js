@@ -19,7 +19,6 @@ app.get('/webhook', (req, res) => {
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('Webhook verificado');
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
@@ -34,11 +33,14 @@ app.post('/webhook', async (req, res) => {
     const entry = body.entry?.[0];
     const changes = entry?.changes?.[0];
     const message = changes?.value?.messages?.[0];
+    const contacts = changes?.value?.contacts?.[0];
     const phoneNumberId = changes?.value?.metadata?.phone_number_id;
 
     if (!message) return res.sendStatus(200);
 
     const userPhone = message.from;
+    // Nombre del perfil de WhatsApp (cuando Meta lo provee)
+    const waProfileName = contacts?.profile?.name || null;
 
     const { data: client, error } = await supabase
       .from('clients')
@@ -47,42 +49,39 @@ app.post('/webhook', async (req, res) => {
       .eq('active', true)
       .single();
 
-    if (error || !client) {
-      console.log('Cliente no encontrado para: ' + phoneNumberId);
-      return res.sendStatus(200);
-    }
+    if (error || !client) return res.sendStatus(200);
 
     let userMessage = '';
 
-    // Manejar diferentes tipos de mensajes
     if (message.type === 'text') {
       userMessage = message.text.body;
-
     } else if (message.type === 'audio') {
-      console.log('Audio recibido de ' + userPhone);
       const audioUrl = await getMediaUrl(message.audio.id, client.whatsapp_token);
       const transcription = await transcribeAudio(audioUrl, client.whatsapp_token);
       userMessage = '[Nota de voz]: ' + transcription;
-
     } else if (message.type === 'image') {
-      console.log('Imagen recibida de ' + userPhone);
       const imageUrl = await getMediaUrl(message.image.id, client.whatsapp_token);
-      userMessage = '[El cliente envio una imagen: ' + imageUrl + '] Responde que recibiste la imagen y que la estas revisando, y si puedes identificar algo relevante para la venta, mencíonalo.';
-
+      userMessage = '[El cliente envio una imagen] Responde que la recibiste y la estas revisando.';
     } else if (message.type === 'document') {
-      userMessage = '[El cliente envio un documento] Responde que recibiste el documento y que lo revisaras pronto.';
-
+      userMessage = '[El cliente envio un documento] Responde que lo recibiste.';
     } else {
       return res.sendStatus(200);
     }
 
-    console.log('Mensaje de ' + userPhone + ': ' + userMessage);
+    // Obtener o crear conversacion con nombre guardado
+    const conversation = await getOrCreateConversation(client.id, userPhone, waProfileName);
+    const userName = conversation.user_name;
+    const history = conversation.messages || [];
 
-    const history = await getConversationHistory(client.id, userPhone);
-    const aiResponse = await getAIResponse(client, userMessage, history);
-    await saveMessage(client.id, userPhone, userMessage, aiResponse);
+    console.log('Mensaje de ' + (userName || userPhone) + ': ' + userMessage);
 
-    // Verificar si hay que enviar imagen de producto
+    const aiResponse = await getAIResponse(client, userMessage, history, userName);
+    
+    // Detectar si el usuario dijo su nombre en este mensaje
+    const detectedName = detectNameInMessage(userMessage, userName);
+    
+    await saveMessage(client.id, userPhone, userMessage, aiResponse, detectedName || userName);
+
     const productImage = detectProductImage(aiResponse, client);
     if (productImage) {
       await sendWhatsAppImage(userPhone, productImage.url, productImage.caption, phoneNumberId, client.whatsapp_token);
@@ -97,116 +96,72 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Obtener URL de media de Meta
-async function getMediaUrl(mediaId, token) {
-  const response = await axios.get(
-    'https://graph.facebook.com/v18.0/' + mediaId,
-    { headers: { 'Authorization': 'Bearer ' + token } }
-  );
-  return response.data.url;
-}
-
-// Transcribir audio con Whisper via OpenRouter
-async function transcribeAudio(audioUrl, token) {
-  try {
-    const audioResponse = await axios.get(audioUrl, {
-      responseType: 'arraybuffer',
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
-
-    const formData = new FormData();
-    formData.append('file', Buffer.from(audioResponse.data), {
-      filename: 'audio.ogg',
-      contentType: 'audio/ogg'
-    });
-    formData.append('model', 'whisper-1');
-
-    const response = await axios.post(
-      'https://api.openai.com/v1/audio/transcriptions',
-      formData,
-      {
-        headers: {
-          'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
-          ...formData.getHeaders()
-        }
-      }
-    );
-    return response.data.text;
-  } catch (error) {
-    console.error('Error transcribiendo audio:', error.message);
-    return 'No pude entender el audio, por favor escribe tu mensaje.';
-  }
-}
-
-// Detectar si el bot menciona un producto y tiene imagen
-function detectProductImage(aiResponse, client) {
-  if (!client.product_images) return null;
-  try {
-    const images = JSON.parse(client.product_images);
-    for (const product of images) {
-      if (aiResponse.toLowerCase().includes(product.name.toLowerCase())) {
-        return product;
-      }
-    }
-  } catch { return null; }
-  return null;
-}
-
-async function getConversationHistory(clientId, userPhone) {
+// Obtener o crear conversacion
+async function getOrCreateConversation(clientId, userPhone, waProfileName) {
   try {
     const { data } = await supabase
       .from('conversations')
-      .select('messages')
-      .eq('client_id', clientId)
-      .eq('user_phone', userPhone)
-      .maybeSingle();
-    return data?.messages || [];
-  } catch {
-    return [];
-  }
-}
-
-async function saveMessage(clientId, userPhone, userMessage, aiResponse) {
-  try {
-    const { data: existing } = await supabase
-      .from('conversations')
-      .select('messages')
+      .select('messages, user_name')
       .eq('client_id', clientId)
       .eq('user_phone', userPhone)
       .maybeSingle();
 
-    const history = existing?.messages || [];
-    const updated = [
-      ...history,
-      { role: 'user', content: userMessage },
-      { role: 'assistant', content: aiResponse }
-    ].slice(-30);
-
-    if (existing) {
-      await supabase
-        .from('conversations')
-        .update({ messages: updated, updated_at: new Date().toISOString() })
-        .eq('client_id', clientId)
-        .eq('user_phone', userPhone);
-    } else {
-      await supabase
-        .from('conversations')
-        .insert({
-          client_id: clientId,
-          user_phone: userPhone,
-          messages: updated,
-          updated_at: new Date().toISOString()
-        });
+    if (data) {
+      // Si no tenia nombre pero WhatsApp nos lo dio, actualizarlo
+      if (!data.user_name && waProfileName) {
+        await supabase
+          .from('conversations')
+          .update({ user_name: waProfileName })
+          .eq('client_id', clientId)
+          .eq('user_phone', userPhone);
+        return { ...data, user_name: waProfileName };
+      }
+      return data;
     }
+
+    // Primera vez que escribe
+    await supabase
+      .from('conversations')
+      .insert({
+        client_id: clientId,
+        user_phone: userPhone,
+        user_name: waProfileName,
+        messages: [],
+        updated_at: new Date().toISOString()
+      });
+
+    return { messages: [], user_name: waProfileName };
   } catch (error) {
-    console.error('Error guardando mensaje:', error.message);
+    console.error('Error en conversacion:', error.message);
+    return { messages: [], user_name: waProfileName };
   }
 }
 
-async function getAIResponse(client, userMessage, history) {
+// Detectar nombre en el mensaje
+function detectNameInMessage(message, currentName) {
+  if (currentName) return null;
+  const patterns = [
+    /(?:me llamo|soy|mi nombre es)\s+([A-Za-záéíóúÁÉÍÓÚñÑ]+)/i,
+    /^([A-Za-záéíóúÁÉÍÓÚñÑ]{3,15})$/
+  ];
+  for (const pattern of patterns) {
+    const match = message.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+async function getAIResponse(client, userMessage, history, userName) {
   let systemPrompt = client.prompt;
   if (client.faq) systemPrompt += '\n\nPREGUNTAS FRECUENTES:\n' + client.faq;
   if (client.catalog) systemPrompt += '\n\nCATALOGO:\n' + client.catalog;
+
+  // Inyectar nombre si lo sabemos
+  if (userName) {
+    systemPrompt += '\n\nIMPORTANTE: El nombre del cliente es ' + userName + '. Usalo naturalmente en la conversacion.';
+  } else {
+    systemPrompt += '\n\nIMPORTANTE: No sabes el nombre del cliente todavia. En tu primer mensaje preguntale su nombre de forma natural.';
+  }
 
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -225,6 +180,85 @@ async function getAIResponse(client, userMessage, history) {
     }
   );
   return response.data.choices[0].message.content;
+}
+
+async function saveMessage(clientId, userPhone, userMessage, aiResponse, userName) {
+  try {
+    const { data: existing } = await supabase
+      .from('conversations')
+      .select('messages')
+      .eq('client_id', clientId)
+      .eq('user_phone', userPhone)
+      .maybeSingle();
+
+    const history = existing?.messages || [];
+    const updated = [
+      ...history,
+      { role: 'user', content: userMessage },
+      { role: 'assistant', content: aiResponse }
+    ].slice(-30);
+
+    await supabase
+      .from('conversations')
+      .update({
+        messages: updated,
+        user_name: userName,
+        updated_at: new Date().toISOString()
+      })
+      .eq('client_id', clientId)
+      .eq('user_phone', userPhone);
+  } catch (error) {
+    console.error('Error guardando:', error.message);
+  }
+}
+
+async function getMediaUrl(mediaId, token) {
+  const response = await axios.get(
+    'https://graph.facebook.com/v18.0/' + mediaId,
+    { headers: { 'Authorization': 'Bearer ' + token } }
+  );
+  return response.data.url;
+}
+
+async function transcribeAudio(audioUrl, token) {
+  try {
+    const audioResponse = await axios.get(audioUrl, {
+      responseType: 'arraybuffer',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    const formData = new FormData();
+    formData.append('file', Buffer.from(audioResponse.data), {
+      filename: 'audio.ogg',
+      contentType: 'audio/ogg'
+    });
+    formData.append('model', 'whisper-1');
+    const response = await axios.post(
+      'https://api.openai.com/v1/audio/transcriptions',
+      formData,
+      {
+        headers: {
+          'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
+          ...formData.getHeaders()
+        }
+      }
+    );
+    return response.data.text;
+  } catch (error) {
+    return 'No pude entender el audio, por favor escribe tu mensaje.';
+  }
+}
+
+function detectProductImage(aiResponse, client) {
+  if (!client.product_images) return null;
+  try {
+    const images = JSON.parse(client.product_images);
+    for (const product of images) {
+      if (aiResponse.toLowerCase().includes(product.name.toLowerCase())) {
+        return product;
+      }
+    }
+  } catch { return null; }
+  return null;
 }
 
 async function sendWhatsAppMessage(to, message, phoneNumberId, token) {
