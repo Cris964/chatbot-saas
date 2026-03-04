@@ -84,7 +84,7 @@ async function getConversationHistory(clientId, userPhone) {
       .select('messages')
       .eq('client_id', clientId)
       .eq('user_phone', userPhone)
-      .single();
+      .maybeSingle();
     return data?.messages || [];
   } catch {
     return [];
@@ -93,23 +93,41 @@ async function getConversationHistory(clientId, userPhone) {
 
 // Guardar mensaje en historial
 async function saveMessage(clientId, userPhone, userMessage, aiResponse) {
-  const history = await getConversationHistory(clientId, userPhone);
-  const updated = [
-    ...history,
-    { role: 'user', content: userMessage },
-    { role: 'assistant', content: aiResponse }
-  ].slice(-20); // Guardar solo los ultimos 20 mensajes
+  try {
+    const { data: existing } = await supabase
+      .from('conversations')
+      .select('messages')
+      .eq('client_id', clientId)
+      .eq('user_phone', userPhone)
+      .maybeSingle();
 
-  await supabase
-    .from('conversations')
-    .upsert({
-      client_id: clientId,
-      user_phone: userPhone,
-      messages: updated,
-      updated_at: new Date().toISOString()
-    }, { onConflict: 'client_id,user_phone' });
+    const history = existing?.messages || [];
+    const updated = [
+      ...history,
+      { role: 'user', content: userMessage },
+      { role: 'assistant', content: aiResponse }
+    ].slice(-30);
+
+    if (existing) {
+      await supabase
+        .from('conversations')
+        .update({ messages: updated, updated_at: new Date().toISOString() })
+        .eq('client_id', clientId)
+        .eq('user_phone', userPhone);
+    } else {
+      await supabase
+        .from('conversations')
+        .insert({
+          client_id: clientId,
+          user_phone: userPhone,
+          messages: updated,
+          updated_at: new Date().toISOString()
+        });
+    }
+  } catch (error) {
+    console.error('Error guardando mensaje:', error.message);
+  }
 }
-
 // Llamar a la IA
 async function getAIResponse(client, userMessage, history) {
   // Construir prompt completo con FAQ y catalogo si existen
