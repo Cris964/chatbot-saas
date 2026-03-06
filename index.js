@@ -97,12 +97,14 @@ app.post('/webhook', async (req, res) => {
     // ── Respuesta IA ────────────────────────────────────────────────
     const aiResponse = await getAIResponse(client, userMessage, history, userName);
 
-    // ── Guardar conversación ────────────────────────────────────────
-    await saveMessage(client.id, userPhone, userMessage, aiResponse, userName, productImage?.key);
-
-    // ── Detectar y enviar imagen de producto (solo 1 vez por producto) ─
+    // ── Detectar imagen de producto (antes de guardar, para marcarla) ─
     const sentImages = getSentImages(history);
     const productImage = detectProductImage(aiResponse, client, sentImages);
+
+    // ── Guardar conversación (con marcador de imagen si aplica) ──────
+    await saveMessage(client.id, userPhone, userMessage, aiResponse, userName, productImage?.key);
+
+    // ── Enviar imagen de producto si se detectó ──────────────────────
     if (productImage) {
       console.log('📸 Enviando imagen de producto:', productImage.name);
       await sendWhatsAppImage(
