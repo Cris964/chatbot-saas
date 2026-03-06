@@ -14,17 +14,20 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// ─── Webhook verificación ───────────────────────────────────────────
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('✅ Webhook verificado');
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
   }
 });
 
+// ─── Webhook principal ──────────────────────────────────────────────
 app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
@@ -32,16 +35,20 @@ app.post('/webhook', async (req, res) => {
 
     const entry = body.entry?.[0];
     const changes = entry?.changes?.[0];
-    const message = changes?.value?.messages?.[0];
-    const contacts = changes?.value?.contacts?.[0];
-    const phoneNumberId = changes?.value?.metadata?.phone_number_id;
+    const value = changes?.value;
+    const message = value?.messages?.[0];
+    const phoneNumberId = value?.metadata?.phone_number_id;
+    const contacts = value?.contacts?.[0];
 
     if (!message) return res.sendStatus(200);
 
     const userPhone = message.from;
-    // Nombre del perfil de WhatsApp (cuando Meta lo provee)
-    const waProfileName = contacts?.profile?.name || null;
+    // Obtener nombre del perfil de WhatsApp
+    const profileName = contacts?.profile?.name || null;
 
+    console.log(`📩 Mensaje de ${profileName || userPhone} (${userPhone})`);
+
+    // Buscar cliente por phone_number_id
     const { data: client, error } = await supabase
       .from('clients')
       .select('*')
@@ -49,177 +56,117 @@ app.post('/webhook', async (req, res) => {
       .eq('active', true)
       .single();
 
-    if (error || !client) return res.sendStatus(200);
+    if (error || !client) {
+      console.log('❌ Cliente no encontrado para:', phoneNumberId);
+      return res.sendStatus(200);
+    }
 
     let userMessage = '';
 
+    // ── Tipo de mensaje ──────────────────────────────────────────────
     if (message.type === 'text') {
       userMessage = message.text.body;
+
     } else if (message.type === 'audio') {
-      const audioUrl = await getMediaUrl(message.audio.id, client.whatsapp_token);
-      const transcription = await transcribeAudio(audioUrl, client.whatsapp_token);
-      userMessage = '[Nota de voz]: ' + transcription;
+      console.log('🎤 Audio recibido de', userPhone);
+      try {
+        const audioUrl = await getMediaUrl(message.audio.id, client.whatsapp_token);
+        const transcription = await transcribeAudio(audioUrl, client.whatsapp_token);
+        userMessage = '[Nota de voz]: ' + transcription;
+      } catch (e) {
+        userMessage = '[El cliente envió una nota de voz que no pude transcribir]';
+      }
+
     } else if (message.type === 'image') {
-      const imageUrl = await getMediaUrl(message.image.id, client.whatsapp_token);
-      userMessage = '[El cliente envio una imagen] Responde que la recibiste y la estas revisando.';
+      console.log('🖼️ Imagen recibida de', userPhone);
+      userMessage = '[El cliente envió una imagen] Responde amablemente que recibiste la imagen y pregunta en qué puedes ayudarle.';
+
     } else if (message.type === 'document') {
-      userMessage = '[El cliente envio un documento] Responde que lo recibiste.';
+      userMessage = '[El cliente envió un documento] Responde que recibiste el documento y lo revisarás pronto.';
+
     } else {
       return res.sendStatus(200);
     }
 
-    // Obtener o crear conversacion con nombre guardado
-    const conversation = await getOrCreateConversation(client.id, userPhone, waProfileName);
-    const userName = conversation.user_name;
-    const history = conversation.messages || [];
+    // ── Obtener historial y nombre guardado ─────────────────────────
+    const { history, savedName } = await getConversationHistory(client.id, userPhone);
 
-    console.log('Mensaje de ' + (userName || userPhone) + ': ' + userMessage);
+    // Determinar nombre a usar
+    const userName = profileName || savedName || null;
 
+    // ── Respuesta IA ────────────────────────────────────────────────
     const aiResponse = await getAIResponse(client, userMessage, history, userName);
-    
-    // Detectar si el usuario dijo su nombre en este mensaje
-    const detectedName = detectNameInMessage(userMessage, userName);
-    
-    await saveMessage(client.id, userPhone, userMessage, aiResponse, detectedName || userName);
 
+    // ── Guardar conversación ────────────────────────────────────────
+    await saveMessage(client.id, userPhone, userMessage, aiResponse, userName);
+
+    // ── Detectar y enviar imagen de producto ────────────────────────
     const productImage = detectProductImage(aiResponse, client);
     if (productImage) {
-      await sendWhatsAppImage(userPhone, productImage.url, productImage.caption, phoneNumberId, client.whatsapp_token);
+      console.log('📸 Enviando imagen de producto:', productImage.name);
+      await sendWhatsAppImage(
+        userPhone,
+        productImage.url,
+        `🌿 ${productImage.name} - Natural Palagar`,
+        phoneNumberId,
+        client.whatsapp_token
+      );
     }
 
+    // ── Enviar respuesta de texto ───────────────────────────────────
     await sendWhatsAppMessage(userPhone, aiResponse, phoneNumberId, client.whatsapp_token);
 
     res.sendStatus(200);
   } catch (error) {
-    console.error('Error:', error.message);
+    console.error('❌ Error general:', error.message);
     res.sendStatus(500);
   }
 });
 
-// Obtener o crear conversacion
-async function getOrCreateConversation(clientId, userPhone, waProfileName) {
+// ─── Detectar producto en respuesta y devolver imagen ───────────────
+// El JSON en Supabase tiene formato: {"7TOROS":"https://...","BERENLIN":"https://...", ...}
+function detectProductImage(aiResponse, client) {
+  if (!client.product_images) return null;
   try {
-    const { data } = await supabase
-      .from('conversations')
-      .select('messages, user_name')
-      .eq('client_id', clientId)
-      .eq('user_phone', userPhone)
-      .maybeSingle();
+    const images = JSON.parse(client.product_images);
+    const responseUpper = aiResponse.toUpperCase();
 
-    if (data) {
-      // Si no tenia nombre pero WhatsApp nos lo dio, actualizarlo
-      if (!data.user_name && waProfileName) {
-        await supabase
-          .from('conversations')
-          .update({ user_name: waProfileName })
-          .eq('client_id', clientId)
-          .eq('user_phone', userPhone);
-        return { ...data, user_name: waProfileName };
+    // Mapa de palabras clave → nombre de clave en el JSON
+    const productKeywords = {
+      '7TOROS':       ['7 TOROS', '7TOROS', 'SIETE TOROS', 'MACA', 'BOROJO', 'BOROJÓ'],
+      'BERENLIN':     ['BERENLIN', 'UVA', 'RESVERATROL', 'COLÁGENO HIDROLIZADO'],
+      'BRILPRO':      ['BRIL-PRO', 'BRILPRO', 'ARANDANO', 'ARÁNDANO', 'PEREJIL'],
+      'CASIGUA':      ['CASIGUA', 'PITAHAYA', 'CIRUELA', 'CALABAZA'],
+      'CIRLAN':       ['CIR-LAN', 'CIRLAN', 'CEBOLLA', 'AJO', 'LIMÓN'],
+      'CXP':          ['CX-P', 'CXP', 'CITRATO DE MAGNESIO', 'CITRATO DE POTASIO'],
+      'KOLOSAL':      ['KOLOSAL', 'PIÑA', 'PAPAYA', 'NARANJA', 'PITAYA'],
+      'MEMOTRON':     ['MEMOTRON', 'MEMORIA', 'CONCENTRACIÓN'],
+      'MR_FIBRA_PINA':['MR FIBRA', 'FIBRA PIÑA', 'CIRUELA PIÑA', 'LINAZA'],
+      'MR_FIBRA_VERDE':['MR FIBRA VERDE', 'PSYLLIUM', 'TÉ VERDE', 'CHIA', 'CHÍA'],
+      'OXTMAX':       ['OXTMAX', 'CÚRCUMA', 'CURCUMA', 'MANZANILLA'],
+    };
+
+    for (const [key, keywords] of Object.entries(productKeywords)) {
+      if (images[key] && keywords.some(kw => responseUpper.includes(kw))) {
+        return { name: key.replace('_', ' '), url: images[key] };
       }
-      return data;
     }
-
-    // Primera vez que escribe
-    await supabase
-      .from('conversations')
-      .insert({
-        client_id: clientId,
-        user_phone: userPhone,
-        user_name: waProfileName,
-        messages: [],
-        updated_at: new Date().toISOString()
-      });
-
-    return { messages: [], user_name: waProfileName };
-  } catch (error) {
-    console.error('Error en conversacion:', error.message);
-    return { messages: [], user_name: waProfileName };
-  }
-}
-
-// Detectar nombre en el mensaje
-function detectNameInMessage(message, currentName) {
-  if (currentName) return null;
-  const patterns = [
-    /(?:me llamo|soy|mi nombre es)\s+([A-Za-záéíóúÁÉÍÓÚñÑ]+)/i,
-    /^([A-Za-záéíóúÁÉÍÓÚñÑ]{3,15})$/
-  ];
-  for (const pattern of patterns) {
-    const match = message.match(pattern);
-    if (match) return match[1];
+  } catch (e) {
+    console.error('Error parseando product_images:', e.message);
   }
   return null;
 }
 
-async function getAIResponse(client, userMessage, history, userName) {
-  let systemPrompt = client.prompt;
-  if (client.faq) systemPrompt += '\n\nPREGUNTAS FRECUENTES:\n' + client.faq;
-  if (client.catalog) systemPrompt += '\n\nCATALOGO:\n' + client.catalog;
-
-  // Inyectar nombre si lo sabemos
-  if (userName) {
-    systemPrompt += '\n\nIMPORTANTE: El nombre del cliente es ' + userName + '. Usalo naturalmente en la conversacion.';
-  } else {
-    systemPrompt += '\n\nIMPORTANTE: No sabes el nombre del cliente todavia. En tu primer mensaje preguntale su nombre de forma natural.';
-  }
-
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...history,
-    { role: 'user', content: userMessage }
-  ];
-
-  const response = await axios.post(
-    'https://openrouter.ai/api/v1/chat/completions',
-    { model: client.model || 'openai/gpt-3.5-turbo', messages },
-    {
-      headers: {
-        'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
-        'Content-Type': 'application/json'
-      }
-    }
-  );
-  return response.data.choices[0].message.content;
-}
-
-async function saveMessage(clientId, userPhone, userMessage, aiResponse, userName) {
-  try {
-    const { data: existing } = await supabase
-      .from('conversations')
-      .select('messages')
-      .eq('client_id', clientId)
-      .eq('user_phone', userPhone)
-      .maybeSingle();
-
-    const history = existing?.messages || [];
-    const updated = [
-      ...history,
-      { role: 'user', content: userMessage },
-      { role: 'assistant', content: aiResponse }
-    ].slice(-30);
-
-    await supabase
-      .from('conversations')
-      .update({
-        messages: updated,
-        user_name: userName,
-        updated_at: new Date().toISOString()
-      })
-      .eq('client_id', clientId)
-      .eq('user_phone', userPhone);
-  } catch (error) {
-    console.error('Error guardando:', error.message);
-  }
-}
-
+// ─── Obtener URL de media de Meta ────────────────────────────────────
 async function getMediaUrl(mediaId, token) {
   const response = await axios.get(
-    'https://graph.facebook.com/v18.0/' + mediaId,
+    `https://graph.facebook.com/v18.0/${mediaId}`,
     { headers: { 'Authorization': 'Bearer ' + token } }
   );
   return response.data.url;
 }
 
+// ─── Transcribir audio con Whisper ──────────────────────────────────
 async function transcribeAudio(audioUrl, token) {
   try {
     const audioResponse = await axios.get(audioUrl, {
@@ -244,29 +191,119 @@ async function transcribeAudio(audioUrl, token) {
     );
     return response.data.text;
   } catch (error) {
+    console.error('Error transcribiendo:', error.message);
     return 'No pude entender el audio, por favor escribe tu mensaje.';
   }
 }
 
-function detectProductImage(aiResponse, client) {
-  if (!client.product_images) return null;
+// ─── Historial de conversación ───────────────────────────────────────
+async function getConversationHistory(clientId, userPhone) {
   try {
-    const images = JSON.parse(client.product_images);
-    for (const product of images) {
-      if (aiResponse.toLowerCase().includes(product.name.toLowerCase())) {
-        return product;
-      }
-    }
-  } catch { return null; }
-  return null;
+    const { data } = await supabase
+      .from('conversations')
+      .select('messages, user_name')
+      .eq('client_id', clientId)
+      .eq('user_phone', userPhone)
+      .maybeSingle();
+    return {
+      history: data?.messages || [],
+      savedName: data?.user_name || null
+    };
+  } catch {
+    return { history: [], savedName: null };
+  }
 }
 
+// ─── Guardar mensaje ─────────────────────────────────────────────────
+async function saveMessage(clientId, userPhone, userMessage, aiResponse, userName) {
+  try {
+    const { data: existing } = await supabase
+      .from('conversations')
+      .select('messages, user_name')
+      .eq('client_id', clientId)
+      .eq('user_phone', userPhone)
+      .maybeSingle();
+
+    const history = existing?.messages || [];
+    const updated = [
+      ...history,
+      { role: 'user', content: userMessage },
+      { role: 'assistant', content: aiResponse }
+    ].slice(-30);
+
+    // Detectar nombre si el usuario lo menciona ("me llamo X", "soy X")
+    let detectedName = userName;
+    if (!detectedName) {
+      const nameMatch = userMessage.match(/(?:me llamo|mi nombre es|soy)\s+([A-ZÁÉÍÓÚ][a-záéíóú]+(?:\s+[A-ZÁÉÍÓÚ][a-záéíóú]+)?)/i);
+      if (nameMatch) detectedName = nameMatch[1];
+    }
+
+    const nameToSave = detectedName || existing?.user_name || null;
+
+    if (existing) {
+      await supabase
+        .from('conversations')
+        .update({
+          messages: updated,
+          updated_at: new Date().toISOString(),
+          ...(nameToSave && { user_name: nameToSave })
+        })
+        .eq('client_id', clientId)
+        .eq('user_phone', userPhone);
+    } else {
+      await supabase
+        .from('conversations')
+        .insert({
+          client_id: clientId,
+          user_phone: userPhone,
+          messages: updated,
+          updated_at: new Date().toISOString(),
+          user_name: nameToSave
+        });
+    }
+  } catch (error) {
+    console.error('Error guardando mensaje:', error.message);
+  }
+}
+
+// ─── Respuesta IA ────────────────────────────────────────────────────
+async function getAIResponse(client, userMessage, history, userName) {
+  let systemPrompt = client.prompt || '';
+  if (userName) systemPrompt += `\n\nNombre del cliente: ${userName}. Úsalo para personalizar la conversación.`;
+  if (client.faq) systemPrompt += '\n\nPREGUNTAS FRECUENTES:\n' + client.faq;
+  if (client.catalog) systemPrompt += '\n\nCATÁLOGO DE PRODUCTOS:\n' + client.catalog;
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history.slice(-20),
+    { role: 'user', content: userMessage }
+  ];
+
+  const response = await axios.post(
+    'https://openrouter.ai/api/v1/chat/completions',
+    {
+      model: client.model || 'openai/gpt-3.5-turbo',
+      messages,
+      max_tokens: 500,
+      temperature: 0.7
+    },
+    {
+      headers: {
+        'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+  return response.data.choices[0].message.content;
+}
+
+// ─── Enviar mensaje de texto ─────────────────────────────────────────
 async function sendWhatsAppMessage(to, message, phoneNumberId, token) {
   await axios.post(
-    'https://graph.facebook.com/v18.0/' + phoneNumberId + '/messages',
+    `https://graph.facebook.com/v18.0/${phoneNumberId}/messages`,
     {
       messaging_product: 'whatsapp',
-      to: to,
+      to,
       type: 'text',
       text: { body: message }
     },
@@ -274,12 +311,13 @@ async function sendWhatsAppMessage(to, message, phoneNumberId, token) {
   );
 }
 
+// ─── Enviar imagen ───────────────────────────────────────────────────
 async function sendWhatsAppImage(to, imageUrl, caption, phoneNumberId, token) {
   await axios.post(
-    'https://graph.facebook.com/v18.0/' + phoneNumberId + '/messages',
+    `https://graph.facebook.com/v18.0/${phoneNumberId}/messages`,
     {
       messaging_product: 'whatsapp',
-      to: to,
+      to,
       type: 'image',
       image: { link: imageUrl, caption: caption || '' }
     },
@@ -287,7 +325,7 @@ async function sendWhatsAppImage(to, imageUrl, caption, phoneNumberId, token) {
   );
 }
 
-app.get('/', (req, res) => res.send('ChatBot SaaS Multi-cliente funcionando!'));
+app.get('/', (req, res) => res.send('🤖 ChatBot SaaS Multi-cliente funcionando!'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Servidor corriendo en puerto ' + PORT));
+app.listen(PORT, () => console.log(`🚀 Servidor corriendo en puerto ${PORT}`));
