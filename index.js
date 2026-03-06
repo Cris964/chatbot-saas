@@ -98,10 +98,11 @@ app.post('/webhook', async (req, res) => {
     const aiResponse = await getAIResponse(client, userMessage, history, userName);
 
     // ── Guardar conversación ────────────────────────────────────────
-    await saveMessage(client.id, userPhone, userMessage, aiResponse, userName);
+    await saveMessage(client.id, userPhone, userMessage, aiResponse, userName, productImage?.key);
 
-    // ── Detectar y enviar imagen de producto ────────────────────────
-    const productImage = detectProductImage(aiResponse, client);
+    // ── Detectar y enviar imagen de producto (solo 1 vez por producto) ─
+    const sentImages = getSentImages(history);
+    const productImage = detectProductImage(aiResponse, client, sentImages);
     if (productImage) {
       console.log('📸 Enviando imagen de producto:', productImage.name);
       await sendWhatsAppImage(
@@ -123,9 +124,19 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// ─── Obtener imágenes ya enviadas en esta conversación ───────────────
+function getSentImages(history) {
+  // Buscar mensajes del tipo [IMG_SENT:NOMBRE] que guardamos como marcadores
+  const sent = new Set();
+  for (const msg of history) {
+    const match = msg.content?.match(/\[IMG_SENT:([^\]]+)\]/);
+    if (match) sent.add(match[1]);
+  }
+  return sent;
+}
+
 // ─── Detectar producto en respuesta y devolver imagen ───────────────
-// El JSON en Supabase tiene formato: {"7TOROS":"https://...","BERENLIN":"https://...", ...}
-function detectProductImage(aiResponse, client) {
+function detectProductImage(aiResponse, client, sentImages = new Set()) {
   if (!client.product_images) return null;
   try {
     const images = JSON.parse(client.product_images);
@@ -147,8 +158,8 @@ function detectProductImage(aiResponse, client) {
     };
 
     for (const [key, keywords] of Object.entries(productKeywords)) {
-      if (images[key] && keywords.some(kw => responseUpper.includes(kw))) {
-        return { name: key.replace('_', ' '), url: images[key] };
+      if (images[key] && !sentImages.has(key) && keywords.some(kw => responseUpper.includes(kw))) {
+        return { name: key.replace('_', ' '), url: images[key], key };
       }
     }
   } catch (e) {
@@ -215,7 +226,7 @@ async function getConversationHistory(clientId, userPhone) {
 }
 
 // ─── Guardar mensaje ─────────────────────────────────────────────────
-async function saveMessage(clientId, userPhone, userMessage, aiResponse, userName) {
+async function saveMessage(clientId, userPhone, userMessage, aiResponse, userName, sentImageKey) {
   try {
     const { data: existing } = await supabase
       .from('conversations')
@@ -225,11 +236,19 @@ async function saveMessage(clientId, userPhone, userMessage, aiResponse, userNam
       .maybeSingle();
 
     const history = existing?.messages || [];
-    const updated = [
-      ...history,
+
+    // Mensajes nuevos
+    const newMsgs = [
       { role: 'user', content: userMessage },
       { role: 'assistant', content: aiResponse }
-    ].slice(-30);
+    ];
+
+    // Si se envió una imagen, agregar marcador invisible al historial
+    if (sentImageKey) {
+      newMsgs.push({ role: 'system', content: `[IMG_SENT:${sentImageKey}]` });
+    }
+
+    const updated = [...history, ...newMsgs].slice(-40);
 
     // Detectar nombre si el usuario lo menciona ("me llamo X", "soy X")
     let detectedName = userName;
