@@ -81,8 +81,16 @@ app.post('/webhook', async (req, res) => {
 
     } else if (message.type === 'image') {
       console.log('🖼️ Imagen recibida de', userPhone);
-      // Descargar imagen y describir con IA visual si es posible
-      userMessage = '[El cliente envió una foto] Responde naturalmente que la recibiste y pregunta en qué le puedes ayudar hoy 🌿';
+      try {
+        // Descargar imagen y analizarla con visión IA
+        const imageBuffer = await getMediaBuffer(message.image.id, client.whatsapp_token);
+        const base64Image = imageBuffer.toString('base64');
+        const mimeType = message.image.mime_type || 'image/jpeg';
+        userMessage = `[IMAGEN_CLIENTE:${mimeType};base64,${base64Image}] El cliente envió esta imagen. Analízala y responde de forma natural: si es un producto nuestro confirma cuál es, si es una foto personal salúdalo, si es algo relacionado con salud ofrece ayuda con nuestros productos.`;
+      } catch (e) {
+        console.error('Error procesando imagen:', e.message);
+        userMessage = '[El cliente envió una foto] Responde que la recibiste y pregunta en qué le puedes ayudar 🌿';
+      }
 
     } else if (message.type === 'document') {
       userMessage = '[El cliente envió un documento] Responde que recibiste el documento y lo revisarás pronto.';
@@ -145,47 +153,38 @@ function getSentImages(history) {
 }
 
 // ─── Detectar producto mencionado y devolver su imagen ───────────────
-// Usa el inventario (image_url + keywords) en lugar del JSON hardcoded
 function detectProductImage(aiResponse, client, sentImages = new Set(), inventory = []) {
   const responseUpper = aiResponse.toUpperCase();
+  console.log('🔍 Buscando imagen para respuesta:', aiResponse.slice(0, 100));
+  console.log('📦 Inventario con imágenes:', inventory.filter(p => p.image_url).map(p => p.name));
 
-  // Primero intentar con inventario (dinámico)
+  // Usar inventario dinámico (keywords + name)
   for (const product of inventory) {
     if (!product.image_url) continue;
-    const keyId = product.name.toUpperCase().replace(/\s+/g, '_');
-    if (sentImages.has(keyId)) continue;
+    const keyId = product.name.toUpperCase().replace(/[\s\/\-]+/g, '_');
+    if (sentImages.has(keyId)) {
+      console.log(`⏭️ Ya se envió imagen de ${product.name}`);
+      continue;
+    }
 
+    // Buscar por nombre del producto directamente
+    const productNameUpper = product.name.toUpperCase().replace(/[\s\/\-]+/g, '');
+    const responseClean = responseUpper.replace(/[\s\/\-]+/g, '');
+    
+    // Buscar por keywords
     const keywords = (product.keywords || product.name)
-      .split(',').map(k => k.trim().toUpperCase());
+      .split(',').map(k => k.trim().toUpperCase()).filter(k => k.length > 3);
 
-    if (keywords.some(kw => kw && responseUpper.includes(kw))) {
+    const nameMatch = responseClean.includes(productNameUpper);
+    const keywordMatch = keywords.some(kw => responseUpper.includes(kw));
+
+    if (nameMatch || keywordMatch) {
+      console.log(`✅ Imagen detectada: ${product.name} (url: ${product.image_url})`);
       return { name: product.name, url: product.image_url, key: keyId };
     }
   }
 
-  // Fallback: JSON estático en client.product_images
-  if (!client.product_images) return null;
-  try {
-    const images = JSON.parse(client.product_images);
-    const staticKeywords = {
-      '7TOROS':        ['7 TOROS','7TRS','MACA','BOROJÓ','BOROJO','CHONTADURO','GUARANA','VIGOR','POTENCIA'],
-      'BERENLIN':      ['BERENLIN','RESVERATROL','AVENA'],
-      'BRILPRO':       ['BRIL-PRO','BRILPRO','ARÁNDANO','ARANDANO','PRÓSTATA','PROSTATA'],
-      'CASIGUA':       ['CASIGUA','PITAHAYA','CALABAZA'],
-      'CIRLAN':        ['CIR-LAN','CIRLAN','COLESTEROL','TRIGLICÉRIDOS','CIRCULACIÓN','VENAS'],
-      'CXP':           ['CX-P','CXP','CITRATO DE MAGNESIO','CALAMBRES'],
-      'KOLOSAL':       ['KOLOSAL','KOLOSAN','COLON IRRITADO','FLORA INTESTINAL'],
-      'MEMOTRON':      ['MEMOTRON','MEMORIA','CONCENTRACIÓN'],
-      'MR_FIBRA_PINA': ['MR FIBRA CIRUELA','FIBRA PIÑA'],
-      'MR_FIBRA_VERDE':['MR FIBRA VERDE','PSYLLIUM','ALCACHOFA','NONI'],
-      'OXTMAX':        ['OXTMAX','CÚRCUMA','ARTRITIS','ARTROSIS','CARTÍLAGO'],
-    };
-    for (const [key, kws] of Object.entries(staticKeywords)) {
-      if (images[key] && !sentImages.has(key) && kws.some(kw => responseUpper.includes(kw))) {
-        return { name: key.replace(/_/g, ' '), url: images[key], key };
-      }
-    }
-  } catch (e) { /* ignorar */ }
+  console.log('❌ No se detectó ningún producto para enviar imagen');
   return null;
 }
 
@@ -381,9 +380,10 @@ async function getInventory(clientId) {
   try {
     const { data } = await supabase
       .from('inventory')
-      .select('name, description, benefits, ingredients, keywords, stock, price, active')
+      .select('name, description, benefits, ingredients, keywords, stock, price, active, image_url')
       .eq('client_id', clientId)
       .order('name')
+    console.log('📋 Inventario cargado:', data?.map(p => `${p.name}(stock:${p.stock},img:${p.image_url ? '✅' : '❌'})`).join(', '))
     return data || []
   } catch (e) {
     console.error('Error obteniendo inventario:', e.message)
@@ -433,16 +433,35 @@ Estos son los únicos productos que puedes ofrecer HOY. Esta lista se actualiza 
 
   if (client.faq) systemPrompt += '\n\nPREGUNTAS FRECUENTES:\n' + client.faq
 
+  // Construir mensajes — detectar si hay imagen del cliente
+  let userContent;
+  if (userMessage.startsWith('[IMAGEN_CLIENTE:')) {
+    // Extraer base64 y mime
+    const match = userMessage.match(/\[IMAGEN_CLIENTE:([^;]+);base64,(.+)\]/s);
+    if (match) {
+      const mimeType = match[1];
+      const base64 = match[2];
+      userContent = [
+        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } },
+        { type: 'text', text: 'Analiza esta imagen y responde naturalmente como Sara, asesora de Naturel. Si reconoces algún producto nuestro dilo. Si es algo personal responde amablemente.' }
+      ];
+    } else {
+      userContent = userMessage;
+    }
+  } else {
+    userContent = userMessage;
+  }
+
   const messages = [
     { role: 'system', content: systemPrompt },
-    ...history.slice(-20),
-    { role: 'user', content: userMessage }
+    ...history.slice(-20).map(m => ({ role: m.role, content: m.content })),
+    { role: 'user', content: userContent }
   ]
 
   const response = await axios.post(
     'https://openrouter.ai/api/v1/chat/completions',
     {
-      model: client.model || 'openai/gpt-4o-mini',
+      model: 'openai/gpt-4o-mini', // gpt-4o-mini soporta visión y sigue instrucciones bien
       messages,
       max_tokens: 600,
       temperature: 0.7
