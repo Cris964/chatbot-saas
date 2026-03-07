@@ -99,6 +99,15 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // ── Detectar si el cliente pide asesor humano ────────────────────
+    const wantsHuman = /asesor|humano|persona real|hablar con alguien|agente|operador/i.test(userMessage);
+    if (wantsHuman) {
+      // Marcar en la conversación que requiere asesor
+      await supabase.from('conversations')
+        .update({ needs_human: true, updated_at: new Date().toISOString() })
+        .eq('client_id', client.id).eq('user_phone', userPhone);
+    }
+
     // ── Obtener historial y nombre guardado ─────────────────────────
     const { history, savedName } = await getConversationHistory(client.id, userPhone);
     const userName = profileName || savedName || null;
@@ -503,6 +512,45 @@ async function sendWhatsAppImage(to, imageUrl, caption, phoneNumberId, token) {
     { headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } }
   );
 }
+
+// ─── Endpoint: Asesor humano envía mensaje a WhatsApp desde CRM ──────
+app.post('/send-advisor-message', async (req, res) => {
+  try {
+    const { clientId, userPhone, message, advisorName } = req.body;
+    if (!clientId || !userPhone || !message) {
+      return res.status(400).json({ error: 'Faltan campos requeridos' });
+    }
+
+    // Obtener datos del cliente
+    const { data: client, error } = await supabase
+      .from('clients').select('*').eq('id', clientId).single();
+    if (error || !client) return res.status(404).json({ error: 'Cliente no encontrado' });
+
+    // Enviar mensaje a WhatsApp
+    await sendWhatsAppMessage(userPhone, message, client.phone_number_id, client.whatsapp_token);
+
+    // Guardar en historial de conversación
+    const { data: conv } = await supabase
+      .from('conversations').select('messages')
+      .eq('client_id', clientId).eq('user_phone', userPhone).maybeSingle();
+
+    const history = conv?.messages || [];
+    const updated = [...history, {
+      role: 'assistant',
+      content: `[Asesor${advisorName ? ' ' + advisorName : ''}]: ${message}`
+    }].slice(-40);
+
+    await supabase.from('conversations')
+      .update({ messages: updated, needs_human: false, updated_at: new Date().toISOString() })
+      .eq('client_id', clientId).eq('user_phone', userPhone);
+
+    console.log(`👤 Asesor envió mensaje a ${userPhone}: ${message}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error enviando mensaje de asesor:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 app.get('/', (req, res) => res.send('🤖 ChatBot SaaS Multi-cliente funcionando!'));
 
