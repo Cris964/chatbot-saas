@@ -90,16 +90,20 @@ app.post('/webhook', async (req, res) => {
 
     // ── Obtener historial y nombre guardado ─────────────────────────
     const { history, savedName } = await getConversationHistory(client.id, userPhone);
-
-    // Determinar nombre a usar
     const userName = profileName || savedName || null;
 
-    // ── Respuesta IA ────────────────────────────────────────────────
-    const aiResponse = await getAIResponse(client, userMessage, history, userName);
+    // ── Obtener inventario en tiempo real ───────────────────────────
+    const inventory = await getInventory(client.id);
+
+    // ── Respuesta IA con inventario ─────────────────────────────────
+    const aiResponse = await getAIResponse(client, userMessage, history, userName, inventory);
 
     // ── Detectar imagen de producto (antes de guardar, para marcarla) ─
     const sentImages = getSentImages(history);
-    const productImage = detectProductImage(aiResponse, client, sentImages);
+    const productImage = detectProductImage(aiResponse, client, sentImages, inventory);
+
+    // ── Detectar si la IA confirmó un pedido y descontar stock ───────
+    await detectAndSaveOrder(aiResponse, client.id, userPhone, userName);
 
     // ── Guardar conversación (con marcador de imagen si aplica) ──────
     await saveMessage(client.id, userPhone, userMessage, aiResponse, userName, productImage?.key);
@@ -137,37 +141,100 @@ function getSentImages(history) {
   return sent;
 }
 
-// ─── Detectar producto en respuesta y devolver imagen ───────────────
-function detectProductImage(aiResponse, client, sentImages = new Set()) {
+// ─── Detectar producto mencionado y devolver su imagen ───────────────
+// Usa el inventario (image_url + keywords) en lugar del JSON hardcoded
+function detectProductImage(aiResponse, client, sentImages = new Set(), inventory = []) {
+  const responseUpper = aiResponse.toUpperCase();
+
+  // Primero intentar con inventario (dinámico)
+  for (const product of inventory) {
+    if (!product.image_url) continue;
+    const keyId = product.name.toUpperCase().replace(/\s+/g, '_');
+    if (sentImages.has(keyId)) continue;
+
+    const keywords = (product.keywords || product.name)
+      .split(',').map(k => k.trim().toUpperCase());
+
+    if (keywords.some(kw => kw && responseUpper.includes(kw))) {
+      return { name: product.name, url: product.image_url, key: keyId };
+    }
+  }
+
+  // Fallback: JSON estático en client.product_images
   if (!client.product_images) return null;
   try {
     const images = JSON.parse(client.product_images);
-    const responseUpper = aiResponse.toUpperCase();
-
-    // Mapa de palabras clave → nombre de clave en el JSON
-    const productKeywords = {
-      '7TOROS':       ['7 TOROS', '7TOROS', 'SIETE TOROS', 'MACA', 'BOROJO', 'BOROJÓ'],
-      'BERENLIN':     ['BERENLIN', 'UVA', 'RESVERATROL', 'COLÁGENO HIDROLIZADO'],
-      'BRILPRO':      ['BRIL-PRO', 'BRILPRO', 'ARANDANO', 'ARÁNDANO', 'PEREJIL'],
-      'CASIGUA':      ['CASIGUA', 'PITAHAYA', 'CIRUELA', 'CALABAZA'],
-      'CIRLAN':       ['CIR-LAN', 'CIRLAN', 'CEBOLLA', 'AJO', 'LIMÓN'],
-      'CXP':          ['CX-P', 'CXP', 'CITRATO DE MAGNESIO', 'CITRATO DE POTASIO'],
-      'KOLOSAL':      ['KOLOSAL', 'PIÑA', 'PAPAYA', 'NARANJA', 'PITAYA'],
-      'MEMOTRON':     ['MEMOTRON', 'MEMORIA', 'CONCENTRACIÓN'],
-      'MR_FIBRA_PINA':['MR FIBRA', 'FIBRA PIÑA', 'CIRUELA PIÑA', 'LINAZA'],
-      'MR_FIBRA_VERDE':['MR FIBRA VERDE', 'PSYLLIUM', 'TÉ VERDE', 'CHIA', 'CHÍA'],
-      'OXTMAX':       ['OXTMAX', 'CÚRCUMA', 'CURCUMA', 'MANZANILLA'],
+    const staticKeywords = {
+      '7TOROS':        ['7 TOROS','7TRS','MACA','BOROJÓ','BOROJO','CHONTADURO','GUARANA','VIGOR','POTENCIA'],
+      'BERENLIN':      ['BERENLIN','RESVERATROL','AVENA'],
+      'BRILPRO':       ['BRIL-PRO','BRILPRO','ARÁNDANO','ARANDANO','PRÓSTATA','PROSTATA'],
+      'CASIGUA':       ['CASIGUA','PITAHAYA','CALABAZA'],
+      'CIRLAN':        ['CIR-LAN','CIRLAN','COLESTEROL','TRIGLICÉRIDOS','CIRCULACIÓN','VENAS'],
+      'CXP':           ['CX-P','CXP','CITRATO DE MAGNESIO','CALAMBRES'],
+      'KOLOSAL':       ['KOLOSAL','KOLOSAN','COLON IRRITADO','FLORA INTESTINAL'],
+      'MEMOTRON':      ['MEMOTRON','MEMORIA','CONCENTRACIÓN'],
+      'MR_FIBRA_PINA': ['MR FIBRA CIRUELA','FIBRA PIÑA'],
+      'MR_FIBRA_VERDE':['MR FIBRA VERDE','PSYLLIUM','ALCACHOFA','NONI'],
+      'OXTMAX':        ['OXTMAX','CÚRCUMA','ARTRITIS','ARTROSIS','CARTÍLAGO'],
     };
+    for (const [key, kws] of Object.entries(staticKeywords)) {
+      if (images[key] && !sentImages.has(key) && kws.some(kw => responseUpper.includes(kw))) {
+        return { name: key.replace(/_/g, ' '), url: images[key], key };
+      }
+    }
+  } catch (e) { /* ignorar */ }
+  return null;
+}
 
-    for (const [key, keywords] of Object.entries(productKeywords)) {
-      if (images[key] && !sentImages.has(key) && keywords.some(kw => responseUpper.includes(kw))) {
-        return { name: key.replace('_', ' '), url: images[key], key };
+// ─── Detectar confirmación de pedido y descontar stock ───────────────
+async function detectAndSaveOrder(aiResponse, clientId, userPhone, userName) {
+  try {
+    // Detectar si la IA confirmó un pedido (frases típicas de confirmación)
+    const confirmPatterns = [
+      /pedido confirmado/i, /tu pedido está listo/i, /pedido registrado/i,
+      /anotado tu pedido/i, /listo tu pedido/i, /pedido tomado/i,
+      /te llega en/i, /enviamos tu pedido/i, /queda confirmado/i,
+      /confirmado.*pedido/i, /pedido.*confirmado/i
+    ];
+    const isConfirmed = confirmPatterns.some(p => p.test(aiResponse));
+    if (!isConfirmed) return;
+
+    // Detectar producto mencionado cerca de la confirmación
+    const { data: products } = await supabase
+      .from('inventory')
+      .select('id, name, keywords, stock')
+      .eq('client_id', clientId)
+      .gt('stock', 0);
+
+    if (!products) return;
+
+    const textUpper = aiResponse.toUpperCase();
+    for (const product of products) {
+      const keywords = (product.keywords || product.name)
+        .split(',').map(k => k.trim().toUpperCase());
+      if (keywords.some(kw => kw && textUpper.includes(kw))) {
+        // Descontar 1 unidad del stock
+        await supabase
+          .from('inventory')
+          .update({ stock: Math.max(product.stock - 1, 0), updated_at: new Date().toISOString() })
+          .eq('id', product.id);
+
+        console.log(`📦 Stock descontado: ${product.name} → ${product.stock - 1} unidades`);
+
+        // Guardar en tabla orders
+        await supabase.from('orders').insert({
+          client_id: clientId,
+          user_phone: userPhone,
+          user_name: userName,
+          product: product.name,
+          status: 'pendiente'
+        });
+        break; // Solo el primer producto detectado
       }
     }
   } catch (e) {
-    console.error('Error parseando product_images:', e.message);
+    console.error('Error detectando pedido:', e.message);
   }
-  return null;
 }
 
 // ─── Obtener URL de media de Meta ────────────────────────────────────
@@ -287,26 +354,86 @@ async function saveMessage(clientId, userPhone, userMessage, aiResponse, userNam
   }
 }
 
-// ─── Respuesta IA ────────────────────────────────────────────────────
-async function getAIResponse(client, userMessage, history, userName) {
-  let systemPrompt = client.prompt || '';
-  if (userName) systemPrompt += `\n\nNombre del cliente: ${userName}. Úsalo para personalizar la conversación.`;
-  if (client.faq) systemPrompt += '\n\nPREGUNTAS FRECUENTES:\n' + client.faq;
-  if (client.catalog) systemPrompt += '\n\nCATÁLOGO DE PRODUCTOS:\n' + client.catalog;
+// ─── Obtener inventario del cliente ─────────────────────────────────
+async function getInventory(clientId) {
+  try {
+    const { data } = await supabase
+      .from('inventory')
+      .select('name, description, benefits, ingredients, keywords, stock, price, active')
+      .eq('client_id', clientId)
+      .order('name')
+    return data || []
+  } catch (e) {
+    console.error('Error obteniendo inventario:', e.message)
+    return []
+  }
+}
+
+// ─── Respuesta IA con inventario en tiempo real ──────────────────────
+async function getAIResponse(client, userMessage, history, userName, inventory = []) {
+  let systemPrompt = client.prompt || ''
+
+  // Nombre del cliente
+  if (userName) systemPrompt += `\n\nNombre del cliente: ${userName}. Úsalo naturalmente en la conversación.`
+
+  // Inyectar inventario en tiempo real
+  if (inventory.length > 0) {
+    const inStock = inventory.filter(p => p.active && p.stock > 0)
+    const outOfStock = inventory.filter(p => p.active && p.stock === 0)
+    const lowStock = inventory.filter(p => p.active && p.stock > 0 && p.stock <= 5)
+
+    systemPrompt += `\n\n═══════════════════════════════
+INVENTARIO EN TIEMPO REAL (consulta esto SIEMPRE antes de ofrecer un producto)
+═══════════════════════════════`
+
+    if (inStock.length > 0) {
+      systemPrompt += `\n\n✅ PRODUCTOS DISPONIBLES:\n`
+      inStock.forEach(p => {
+        systemPrompt += `• ${p.name} — Stock: ${p.stock} unidades`
+        if (p.price) systemPrompt += ` — Precio: $${p.price}`
+        if (p.benefits) systemPrompt += `\n  Para: ${p.benefits}`
+        if (p.ingredients) systemPrompt += `\n  Ingredientes: ${p.ingredients}`
+        systemPrompt += '\n'
+      })
+    }
+
+    if (lowStock.length > 0) {
+      systemPrompt += `\n⚠️ PRODUCTOS CON POCO STOCK (puedes ofrecerlos pero avisa que quedan pocos):\n`
+      lowStock.forEach(p => {
+        systemPrompt += `• ${p.name} — Solo ${p.stock} unidades disponibles\n`
+      })
+    }
+
+    if (outOfStock.length > 0) {
+      systemPrompt += `\n❌ PRODUCTOS AGOTADOS (NO ofrecer, pero si el cliente los pide di que no están disponibles en este momento y que te dejarás sus datos para avisarle cuando lleguen. Mientras tanto ofrece una alternativa del catálogo disponible):\n`
+      outOfStock.forEach(p => {
+        systemPrompt += `• ${p.name}\n`
+      })
+    }
+
+    systemPrompt += `\nREGLAS IMPORTANTES:
+- NUNCA ofrezcas un producto con stock 0
+- Si el cliente pide algo agotado: "En este momento no tenemos [producto] disponible 😔 pero en cuanto llegue te avisamos. Mientras tanto, ¿te puedo mostrar algo similar que tenemos disponible?"
+- Si el producto tiene poco stock (≤5): puedes mencionarlo para generar urgencia
+- Si el precio está disponible, dilo cuando el cliente pregunte
+- Siempre consulta este inventario antes de recomendar`
+  }
+
+  if (client.faq) systemPrompt += '\n\nPREGUNTAS FRECUENTES:\n' + client.faq
 
   const messages = [
     { role: 'system', content: systemPrompt },
     ...history.slice(-20),
     { role: 'user', content: userMessage }
-  ];
+  ]
 
   const response = await axios.post(
     'https://openrouter.ai/api/v1/chat/completions',
     {
       model: client.model || 'openai/gpt-3.5-turbo',
       messages,
-      max_tokens: 500,
-      temperature: 0.7
+      max_tokens: 600,
+      temperature: 0.75
     },
     {
       headers: {
@@ -314,8 +441,8 @@ async function getAIResponse(client, userMessage, history, userName) {
         'Content-Type': 'application/json'
       }
     }
-  );
-  return response.data.choices[0].message.content;
+  )
+  return response.data.choices[0].message.content
 }
 
 // ─── Enviar mensaje de texto ─────────────────────────────────────────
