@@ -266,30 +266,34 @@ async function getMediaBuffer(mediaId, token) {
   return Buffer.from(fileResponse.data);
 }
 
-// ─── Transcribir audio con Whisper via OpenRouter ────────────────────
+// ─── Transcribir audio con Groq Whisper (gratis y rápido) ───────────
 async function transcribeAudio(audioBuffer) {
   try {
     const formData = new FormData();
     formData.append('file', audioBuffer, {
       filename: 'audio.ogg',
-      contentType: 'audio/ogg; codecs=opus'
+      contentType: 'audio/ogg'
     });
-    formData.append('model', 'openai/whisper-large-v3');
+    formData.append('model', 'whisper-large-v3');
+    formData.append('language', 'es');
+    formData.append('response_format', 'json');
 
     const response = await axios.post(
-      'https://openrouter.ai/api/v1/audio/transcriptions',
+      'https://api.groq.com/openai/v1/audio/transcriptions',
       formData,
       {
         headers: {
-          'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
+          'Authorization': 'Bearer ' + process.env.GROQ_API_KEY,
           ...formData.getHeaders()
         },
         timeout: 30000
       }
     );
-    return response.data.text || 'No pude entender el audio';
+    const text = response.data.text?.trim();
+    console.log('📝 Transcripción Groq:', text);
+    return text || 'no entendí el audio';
   } catch (error) {
-    console.error('Error transcribiendo audio:', error.response?.data || error.message);
+    console.error('Error Groq transcripción:', error.response?.data || error.message);
     throw error;
   }
 }
