@@ -99,6 +99,24 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // ── Verificar si hay asesor humano activo (no responder con IA) ──
+    const { data: convCheck } = await supabase
+      .from('conversations')
+      .select('needs_human, messages')
+      .eq('client_id', client.id)
+      .eq('user_phone', userPhone)
+      .maybeSingle();
+
+    // Si el último mensaje fue de un asesor, el bot no responde
+    const lastMessages = convCheck?.messages || [];
+    const lastMsg = lastMessages[lastMessages.length - 1];
+    const advisorIsActive = lastMsg?.content?.startsWith('[Asesor]');
+
+    if (advisorIsActive) {
+      console.log('👤 Asesor activo — bot no responde');
+      return res.sendStatus(200);
+    }
+
     // ── Detectar si el cliente pide asesor humano ────────────────────
     const wantsHuman = /asesor|humano|persona real|hablar con alguien|agente|operador/i.test(userMessage);
     if (wantsHuman) {
