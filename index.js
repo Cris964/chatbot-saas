@@ -70,16 +70,19 @@ app.post('/webhook', async (req, res) => {
     } else if (message.type === 'audio') {
       console.log('🎤 Audio recibido de', userPhone);
       try {
-        const audioUrl = await getMediaUrl(message.audio.id, client.whatsapp_token);
-        const transcription = await transcribeAudio(audioUrl, client.whatsapp_token);
-        userMessage = '[Nota de voz]: ' + transcription;
+        const audioBuffer = await getMediaBuffer(message.audio.id, client.whatsapp_token);
+        const transcription = await transcribeAudio(audioBuffer);
+        console.log('📝 Transcripción:', transcription);
+        userMessage = transcription; // Tratar como texto normal, sin prefijo
       } catch (e) {
-        userMessage = '[El cliente envió una nota de voz que no pude transcribir]';
+        console.error('Error en audio:', e.message);
+        userMessage = '[nota de voz no transcrita] Pide amablemente que repita por texto';
       }
 
     } else if (message.type === 'image') {
       console.log('🖼️ Imagen recibida de', userPhone);
-      userMessage = '[El cliente envió una imagen] Responde amablemente que recibiste la imagen y pregunta en qué puedes ayudarle.';
+      // Descargar imagen y describir con IA visual si es posible
+      userMessage = '[El cliente envió una foto] Responde naturalmente que la recibiste y pregunta en qué le puedes ayudar hoy 🌿';
 
     } else if (message.type === 'document') {
       userMessage = '[El cliente envió un documento] Responde que recibiste el documento y lo revisarás pronto.';
@@ -246,33 +249,48 @@ async function getMediaUrl(mediaId, token) {
   return response.data.url;
 }
 
-// ─── Transcribir audio con Whisper ──────────────────────────────────
-async function transcribeAudio(audioUrl, token) {
+// ─── Descargar buffer de audio desde Meta ────────────────────────────
+async function getMediaBuffer(mediaId, token) {
+  // Primero obtener la URL del archivo
+  const urlResponse = await axios.get(
+    `https://graph.facebook.com/v18.0/${mediaId}`,
+    { headers: { 'Authorization': 'Bearer ' + token } }
+  );
+  const mediaUrl = urlResponse.data.url;
+
+  // Luego descargar el archivo
+  const fileResponse = await axios.get(mediaUrl, {
+    responseType: 'arraybuffer',
+    headers: { 'Authorization': 'Bearer ' + token }
+  });
+  return Buffer.from(fileResponse.data);
+}
+
+// ─── Transcribir audio con Whisper via OpenRouter ────────────────────
+async function transcribeAudio(audioBuffer) {
   try {
-    const audioResponse = await axios.get(audioUrl, {
-      responseType: 'arraybuffer',
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
     const formData = new FormData();
-    formData.append('file', Buffer.from(audioResponse.data), {
+    formData.append('file', audioBuffer, {
       filename: 'audio.ogg',
-      contentType: 'audio/ogg'
+      contentType: 'audio/ogg; codecs=opus'
     });
-    formData.append('model', 'whisper-1');
+    formData.append('model', 'openai/whisper-large-v3');
+
     const response = await axios.post(
-      'https://api.openai.com/v1/audio/transcriptions',
+      'https://openrouter.ai/api/v1/audio/transcriptions',
       formData,
       {
         headers: {
           'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
           ...formData.getHeaders()
-        }
+        },
+        timeout: 30000
       }
     );
-    return response.data.text;
+    return response.data.text || 'No pude entender el audio';
   } catch (error) {
-    console.error('Error transcribiendo:', error.message);
-    return 'No pude entender el audio, por favor escribe tu mensaje.';
+    console.error('Error transcribiendo audio:', error.response?.data || error.message);
+    throw error;
   }
 }
 
@@ -371,53 +389,43 @@ async function getInventory(clientId) {
 
 // ─── Respuesta IA con inventario en tiempo real ──────────────────────
 async function getAIResponse(client, userMessage, history, userName, inventory = []) {
-  let systemPrompt = client.prompt || ''
+  let systemPrompt = ''
 
-  // Nombre del cliente
-  if (userName) systemPrompt += `\n\nNombre del cliente: ${userName}. Úsalo naturalmente en la conversación.`
-
-  // Inyectar inventario en tiempo real
+  // ⚠️ INVENTARIO PRIMERO — para que la IA lo respete siempre
   if (inventory.length > 0) {
     const inStock = inventory.filter(p => p.active && p.stock > 0)
     const outOfStock = inventory.filter(p => p.active && p.stock === 0)
-    const lowStock = inventory.filter(p => p.active && p.stock > 0 && p.stock <= 5)
 
-    systemPrompt += `\n\n═══════════════════════════════
-INVENTARIO EN TIEMPO REAL (consulta esto SIEMPRE antes de ofrecer un producto)
-═══════════════════════════════`
+    systemPrompt += `REGLA ABSOLUTA #1 — STOCK EN TIEMPO REAL:
+Estos son los únicos productos que puedes ofrecer HOY. Esta lista se actualiza en tiempo real.
+
+`
+    if (outOfStock.length > 0) {
+      systemPrompt += `❌ PRODUCTOS AGOTADOS — PROHIBIDO OFRECERLOS O DECIR QUE HAY DISPONIBILIDAD:\n`
+      outOfStock.forEach(p => { systemPrompt += `• ${p.name} — SIN STOCK, NO DISPONIBLE\n` })
+      systemPrompt += `\nSi alguien pregunta por un producto agotado, di EXACTAMENTE: "En este momento no tenemos [producto] disponible 😔 pero en cuanto llegue te aviso. ¿Te puedo mostrar algo similar?"\n\n`
+    }
 
     if (inStock.length > 0) {
-      systemPrompt += `\n\n✅ PRODUCTOS DISPONIBLES:\n`
+      systemPrompt += `✅ PRODUCTOS DISPONIBLES PARA VENDER:\n`
       inStock.forEach(p => {
-        systemPrompt += `• ${p.name} — Stock: ${p.stock} unidades`
-        if (p.price) systemPrompt += ` — Precio: $${p.price}`
-        if (p.benefits) systemPrompt += `\n  Para: ${p.benefits}`
-        if (p.ingredients) systemPrompt += `\n  Ingredientes: ${p.ingredients}`
+        systemPrompt += `• ${p.name} — ${p.stock} unidades disponibles`
+        if (p.price) systemPrompt += ` — $${p.price}`
+        if (p.benefits) systemPrompt += ` — Para: ${p.benefits}`
         systemPrompt += '\n'
       })
+    } else {
+      systemPrompt += `⚠️ En este momento NO hay productos disponibles en inventario.\n`
     }
 
-    if (lowStock.length > 0) {
-      systemPrompt += `\n⚠️ PRODUCTOS CON POCO STOCK (puedes ofrecerlos pero avisa que quedan pocos):\n`
-      lowStock.forEach(p => {
-        systemPrompt += `• ${p.name} — Solo ${p.stock} unidades disponibles\n`
-      })
-    }
-
-    if (outOfStock.length > 0) {
-      systemPrompt += `\n❌ PRODUCTOS AGOTADOS (NO ofrecer, pero si el cliente los pide di que no están disponibles en este momento y que te dejarás sus datos para avisarle cuando lleguen. Mientras tanto ofrece una alternativa del catálogo disponible):\n`
-      outOfStock.forEach(p => {
-        systemPrompt += `• ${p.name}\n`
-      })
-    }
-
-    systemPrompt += `\nREGLAS IMPORTANTES:
-- NUNCA ofrezcas un producto con stock 0
-- Si el cliente pide algo agotado: "En este momento no tenemos [producto] disponible 😔 pero en cuanto llegue te avisamos. Mientras tanto, ¿te puedo mostrar algo similar que tenemos disponible?"
-- Si el producto tiene poco stock (≤5): puedes mencionarlo para generar urgencia
-- Si el precio está disponible, dilo cuando el cliente pregunte
-- Siempre consulta este inventario antes de recomendar`
+    systemPrompt += `\n———————————————————————————————\n\n`
   }
+
+  // Prompt principal del cliente
+  systemPrompt += client.prompt || ''
+
+  // Nombre del cliente
+  if (userName) systemPrompt += `\n\nEl cliente se llama ${userName}. Úsalo naturalmente.`
 
   if (client.faq) systemPrompt += '\n\nPREGUNTAS FRECUENTES:\n' + client.faq
 
@@ -430,10 +438,10 @@ INVENTARIO EN TIEMPO REAL (consulta esto SIEMPRE antes de ofrecer un producto)
   const response = await axios.post(
     'https://openrouter.ai/api/v1/chat/completions',
     {
-      model: client.model || 'openai/gpt-3.5-turbo',
+      model: client.model || 'openai/gpt-4o-mini',
       messages,
       max_tokens: 600,
-      temperature: 0.75
+      temperature: 0.7
     },
     {
       headers: {
