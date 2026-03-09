@@ -577,6 +577,22 @@ async function processOutbox() {
 // Revisar outbox cada 3 segundos
 setInterval(processOutbox, 3000)
 
+// Verificar tabla outbox al iniciar
+async function checkOutboxTable() {
+  try {
+    const { error } = await supabase.from('outbox').select('id').limit(1)
+    if (error) {
+      console.error('❌ Tabla outbox NO existe:', error.message)
+      console.error('👉 Ejecuta el setup.sql en Supabase para crearla')
+    } else {
+      console.log('✅ Tabla outbox OK — procesando mensajes de asesores')
+    }
+  } catch(e) {
+    console.error('❌ Error verificando outbox:', e.message)
+  }
+}
+checkOutboxTable()
+
 app.get('/', (req, res) => res.send('🤖 ChatBot SaaS Multi-cliente funcionando!'));
 
 const PORT = process.env.PORT || 3000;
