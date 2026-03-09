@@ -118,8 +118,16 @@ app.post('/webhook', async (req, res) => {
 
     // Si el último mensaje fue de un asesor, el bot no responde
     const lastMessages = convCheck?.messages || [];
-    const lastMsg = lastMessages[lastMessages.length - 1];
-    const advisorIsActive = lastMsg?.content?.startsWith('[Asesor]');
+    const advisorIsActive = (() => {
+      if (!lastMessages.length) return false
+      for (let i = lastMessages.length - 1; i >= 0; i--) {
+        const m = lastMessages[i]
+        if (m.content?.includes('[BOT_ACTIVO]')) return false
+        if (m.content?.startsWith('[Asesor]')) return true
+        if (m.role === 'user') return false
+      }
+      return false
+    })()
 
     if (advisorIsActive) {
       console.log('👤 Asesor activo — bot no responde');
