@@ -160,8 +160,11 @@ app.post('/webhook', async (req, res) => {
     // ── Detectar si la IA confirmó un pedido y descontar stock ───────
     await detectAndSaveOrder(aiResponse, client.id, userPhone, userName);
 
-    // ── Guardar conversación (con marcador de imagen si aplica) ──────
-    await saveMessage(client.id, userPhone, userMessage, aiResponse, userName, productImage?.key);
+    // ── Guardar conversación — limpiar base64 antes de guardar ──────
+    const messageToSave = userMessage.startsWith('[IMAGEN_CLIENTE:')
+      ? '[El cliente envió una imagen 📷]'
+      : userMessage;
+    await saveMessage(client.id, userPhone, messageToSave, aiResponse, userName, productImage?.key);
 
     // ── Enviar imagen de producto si se detectó ──────────────────────
     if (productImage) {
