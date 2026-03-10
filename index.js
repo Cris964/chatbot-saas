@@ -130,7 +130,9 @@ app.post('/webhook', async (req, res) => {
     })()
 
     if (advisorIsActive) {
-      console.log('👤 Asesor activo — bot no responde');
+      console.log('👤 Asesor activo — guardando mensaje del cliente sin responder IA');
+      // Guardar el mensaje del cliente para que el asesor lo vea en el CRM
+      await saveMessage(client.id, userPhone, userMessage, null, userName, null);
       return res.sendStatus(200);
     }
 
@@ -374,11 +376,13 @@ async function saveMessage(clientId, userPhone, userMessage, aiResponse, userNam
 
     const history = existing?.messages || [];
 
-    // Mensajes nuevos
+    // Mensajes nuevos — solo agregar respuesta IA si existe
     const newMsgs = [
-      { role: 'user', content: userMessage },
-      { role: 'assistant', content: aiResponse }
+      { role: 'user', content: userMessage }
     ];
+    if (aiResponse) {
+      newMsgs.push({ role: 'assistant', content: aiResponse });
+    }
 
     // Si se envió una imagen, agregar marcador invisible al historial
     if (sentImageKey) {
