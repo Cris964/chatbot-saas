@@ -116,21 +116,13 @@ app.post('/webhook', async (req, res) => {
       .eq('user_phone', userPhone)
       .maybeSingle();
 
-    // Si el último mensaje fue de un asesor, el bot no responde
-    const lastMessages = convCheck?.messages || [];
-    const advisorIsActive = (() => {
-      if (!lastMessages.length) return false
-      for (let i = lastMessages.length - 1; i >= 0; i--) {
-        const m = lastMessages[i]
-        if (m.content?.includes('[BOT_ACTIVO]')) return false
-        if (m.content?.startsWith('[Asesor]')) return true
-        if (m.role === 'user') return false
-      }
-      return false
-    })()
+    // El CRM controla el modo del bot con la columna needs_human
+    // Si needs_human es true, el bot está DESACTIVADO (asesor activo)
+    // Si needs_human es false, el bot está ACTIVO
+    const advisorIsActive = convCheck?.needs_human === true;
 
     if (advisorIsActive) {
-      console.log('👤 Asesor activo — guardando mensaje del cliente sin responder IA');
+      console.log('👤 Asesor activo (needs_human=true) — guardando mensaje del cliente sin responder IA');
       // Guardar el mensaje del cliente para que el asesor lo vea en el CRM
       await saveMessage(client.id, userPhone, userMessage, null, userName, null);
       return res.sendStatus(200);
