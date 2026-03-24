@@ -497,7 +497,13 @@ Estos son los únicos productos que puedes ofrecer HOY. Esta lista se actualiza 
 
   const messages = [
     { role: 'system', content: systemPrompt },
-    ...history.slice(-20).map(m => ({ role: m.role, content: m.content })),
+    ...history.slice(-20).map(m => {
+      // OpenRouter/OpenAI strictly accept only 'system', 'user', 'assistant' functions.
+      // We map our custom CRM role 'agent' to 'assistant' so the API doesn't crash with a 400 error.
+      let validRole = m.role;
+      if (validRole === 'agent') validRole = 'assistant';
+      return { role: validRole, content: m.content };
+    }),
     { role: 'user', content: userContent }
   ]
 
