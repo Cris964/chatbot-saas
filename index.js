@@ -207,14 +207,13 @@ function getSentImages(history) {
 function detectProductImage(aiResponse, client, sentImages = new Set(), inventory = []) {
   const responseUpper = aiResponse.toUpperCase();
   console.log('🔍 Buscando imagen para respuesta:', aiResponse.slice(0, 100));
-  console.log('📦 Inventario con imágenes:', inventory.filter(p => p.image_url).map(p => p.name));
 
-  // Usar inventario dinámico (keywords + name)
+  // Usar inventario dinámico (solo coincidencia exacta de nombre para evitar falsos positivos con keywords descriptivos)
   for (const product of inventory) {
     if (!product.image_url) continue;
     const keyId = product.name.toUpperCase().replace(/[\s\/\-]+/g, '_');
+    
     if (sentImages.has(keyId)) {
-      console.log(`⏭️ Ya se envió imagen de ${product.name}`);
       continue;
     }
 
@@ -222,15 +221,8 @@ function detectProductImage(aiResponse, client, sentImages = new Set(), inventor
     const productNameUpper = product.name.toUpperCase().replace(/[\s\/\-]+/g, '');
     const responseClean = responseUpper.replace(/[\s\/\-]+/g, '');
     
-    // Buscar por keywords
-    const keywords = (product.keywords || product.name)
-      .split(',').map(k => k.trim().toUpperCase()).filter(k => k.length > 3);
-
-    const nameMatch = responseClean.includes(productNameUpper);
-    const keywordMatch = keywords.some(kw => responseUpper.includes(kw));
-
-    if (nameMatch || keywordMatch) {
-      console.log(`✅ Imagen detectada: ${product.name} (url: ${product.image_url})`);
+    if (responseClean.includes(productNameUpper)) {
+      console.log(`✅ Imagen detectada por nombre exacto: ${product.name} (url: ${product.image_url})`);
       return { name: product.name, url: product.image_url, key: keyId };
     }
   }
