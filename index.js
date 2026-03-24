@@ -154,11 +154,13 @@ app.post('/webhook', async (req, res) => {
     // ── Detectar si la IA confirmó un pedido y descontar stock ───────
     await detectAndSaveOrder(aiResponse, client.id, userPhone, userName);
 
-    // ── Guardar conversación — limpiar base64 antes de guardar ──────
+    // ── Guardar conversación — limpiar base64 y palabras mágicas antes de guardar ──────
+    const strippedResponse = aiResponse.replace(/\[ENVIAR_QR_TRANSFERENCIA\]/g, '').trim();
+
     const messageToSave = userMessage.startsWith('[IMAGEN_CLIENTE:')
       ? '[El cliente envió una imagen 📷]'
       : userMessage;
-    await saveMessage(client.id, userPhone, messageToSave, aiResponse, userName, productImage?.key);
+    await saveMessage(client.id, userPhone, messageToSave, strippedResponse, userName, productImage?.key);
 
     // ── Enviar imagen de producto si se detectó ──────────────────────
     if (productImage) {
@@ -172,8 +174,16 @@ app.post('/webhook', async (req, res) => {
       );
     }
 
-    // ── Enviar respuesta de texto ───────────────────────────────────
-    await sendWhatsAppMessage(userPhone, aiResponse, phoneNumberId, client.whatsapp_token);
+    // ── Enviar QRs de pago si la IA lo decidió ──────────────────────
+    if (aiResponse.includes('[ENVIAR_QR_TRANSFERENCIA]')) {
+      console.log('📸 Enviando QR Nequi y Bancolombia');
+      await sendWhatsAppImage(userPhone, 'https://chatbot-crm-xi.vercel.app/qr_1.jpg', '🏦 Bancolombia QR', phoneNumberId, client.whatsapp_token);
+      await sendWhatsAppImage(userPhone, 'https://chatbot-crm-xi.vercel.app/qr_2.jpg', '💜 Nequi QR', phoneNumberId, client.whatsapp_token);
+    }
+
+    // ── Enviar respuesta de texto limpia ──────────────────────────────
+    await sendWhatsAppMessage(userPhone, strippedResponse, phoneNumberId, client.whatsapp_token);
+
 
     res.sendStatus(200);
   } catch (error) {
@@ -470,6 +480,17 @@ Estos son los únicos productos que puedes ofrecer HOY. Esta lista se actualiza 
 
   // Prompt principal del cliente
   systemPrompt += client.prompt || ''
+
+  systemPrompt += `\n\nREGLAS DE RECAUDO Y PAGOS (MANDATORIO):
+1. Si el cliente menciona que quiere pagar por TRANSFERENCIA (Nequi o Bancolombia), indícale LOS DOS métodos de pago y usa la palabra mágica [ENVIAR_QR_TRANSFERENCIA].
+Ejemplo exacto de cómo debes responder: "¡Claro! Puedes transferir a:
+🏦 Bancolombia (Ahorros): 285-487245-99
+💜 Nequi: 3183701497
+[ENVIAR_QR_TRANSFERENCIA]"
+
+2. Si el cliente menciona que quiere pagar por PSE (o tarjeta), envíalo a la página web:
+Ejemplo exacto: "Puedes realizar tu pago seguro por PSE a través de nuestra página web oficial: supernaturamarketing.com"
+`
 
   // Nombre del cliente
   if (userName) systemPrompt += `\n\nEl cliente se llama ${userName}. Úsalo naturalmente.`
