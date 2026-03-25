@@ -160,7 +160,7 @@ app.post('/webhook', async (req, res) => {
     const messageToSave = userMessage.startsWith('[IMAGEN_CLIENTE:')
       ? '[El cliente envió una imagen 📷]'
       : userMessage;
-    await saveMessage(client.id, userPhone, messageToSave, strippedResponse, userName, productImage?.key);
+    await saveMessage(client.id, userPhone, messageToSave, strippedResponse, userName, productImage);
 
     // ── Enviar imagen de producto si se detectó ──────────────────────
     if (productImage) {
@@ -377,7 +377,7 @@ async function getConversationHistory(clientId, userPhone) {
 }
 
 // ─── Guardar mensaje ─────────────────────────────────────────────────
-async function saveMessage(clientId, userPhone, userMessage, aiResponse, userName, sentImageKey) {
+async function saveMessage(clientId, userPhone, userMessage, aiResponse, userName, productImage) {
   try {
     const { data: existing } = await supabase
       .from('conversations')
@@ -398,9 +398,9 @@ async function saveMessage(clientId, userPhone, userMessage, aiResponse, userNam
       newMsgs.push({ role: 'assistant', content: aiResponse, timestamp });
     }
 
-    // Si se envió una imagen, agregar marcador invisible al historial
-    if (sentImageKey) {
-      newMsgs.push({ role: 'system', content: `[IMG_SENT:${sentImageKey}]` });
+    // Si se enviaron imágenes de producto (IA decidió enviar una foto)
+    if (productImage) {
+      newMsgs.push({ role: 'system', content: `[IMG_SENT:${productImage.name}|${productImage.url}]`, timestamp });
     }
 
     const updated = [...history, ...newMsgs].slice(-40);
