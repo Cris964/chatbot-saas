@@ -254,9 +254,15 @@ async function detectAndSaveOrder(aiResponse, clientId, userPhone, userName) {
     if (!products) return;
 
     const textUpper = aiResponse.toUpperCase();
+    const userMsgUpper = (typeof userMessage === 'string' ? userMessage : '').toUpperCase();
+    
+    // Detectar si hay un comprobante (imagen enviada por el cliente)
+    const hasReceipt = userMessage.includes('[IMAGEN_CLIENTE:');
+
     for (const product of products) {
       const keywords = (product.keywords || product.name)
         .split(',').map(k => k.trim().toUpperCase());
+      
       if (keywords.some(kw => kw && textUpper.includes(kw))) {
         // Descontar 1 unidad del stock
         await supabase
@@ -266,13 +272,25 @@ async function detectAndSaveOrder(aiResponse, clientId, userPhone, userName) {
 
         console.log(`📦 Stock descontado: ${product.name} → ${product.stock - 1} unidades`);
 
-        // Guardar en tabla orders
+        // Extraer ciudad y dirección (intento simple por regex o asumiendo que la IA lo confirma)
+        const cityMatch = aiResponse.match(/ciudad:\s*([^,\.\n]+)/i) || aiResponse.match(/en\s+([A-Z][a-z]+)/);
+        const addressMatch = aiResponse.match(/dirección:\s*([^,\.\n]+)/i);
+        
+        const city = cityMatch ? cityMatch[1].trim() : 'No especificada';
+        const address = addressMatch ? addressMatch[1].trim() : 'No especificada';
+
+        // Guardar en tabla orders con más info para el CRM
         await supabase.from('orders').insert({
           client_id: clientId,
           user_phone: userPhone,
-          user_name: userName,
+          user_name: userName || 'Cliente WhatsApp',
           product: product.name,
-          status: 'pendiente'
+          status: hasReceipt ? 'pagado' : 'pendiente',
+          city: city,
+          address: address,
+          total: product.price || 0,
+          items: [{ name: product.name, qty: 1, price: product.price }],
+          created_at: new Date().toISOString()
         });
         break; // Solo el primer producto detectado
       }
@@ -482,6 +500,20 @@ Ejemplo exacto de cómo debes responder: "¡Claro! Puedes transferir a:
 
 2. Si el cliente menciona que quiere pagar por PSE (o tarjeta), envíalo a la página web:
 Ejemplo exacto: "Puedes realizar tu pago seguro por PSE a través de nuestra página web oficial: supernaturamarketing.com"
+
+3. EXTRACCIÓN DE DATOS DE ENVÍO:
+Cuando el cliente confirme la compra o envíe el comprobante, DEBES pedirle o confirmar:
+- Nombre completo
+- Ciudad de destino
+- Dirección exacta
+- Teléfono de contacto
+
+Si ya tienes estos datos, repítelos para confirmar. Formatea la confirmación así para que el sistema la detecte:
+"¡Perfecto! He registrado tu compra de [Producto]. 
+Datos de envío:
+Ciudad: [Ciudad]
+Dirección: [Dirección]
+Confirmado: ✅"
 `
 
   // Nombre del cliente
