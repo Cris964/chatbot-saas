@@ -275,12 +275,11 @@ async function detectAndSaveOrder(aiResponse, clientId, userPhone, userName) {
         // Extraer ciudad y dirección (intento simple por regex o asumiendo que la IA lo confirma)
         const cityMatch = aiResponse.match(/ciudad:\s*([^,\.\n]+)/i) || aiResponse.match(/en\s+([A-Z][a-z]+)/);
         const addressMatch = aiResponse.match(/dirección:\s*([^,\.\n]+)/i);
-        
         const city = cityMatch ? cityMatch[1].trim() : 'No especificada';
         const address = addressMatch ? addressMatch[1].trim() : 'No especificada';
 
-        // Guardar en tabla orders con más info para el CRM
-        await supabase.from('orders').insert({
+        // Guardar en tabla orders con las columnas confirmadas
+        const { error: insertError } = await supabase.from('orders').insert({
           client_id: clientId,
           user_phone: userPhone,
           user_name: userName || 'Cliente WhatsApp',
@@ -288,10 +287,14 @@ async function detectAndSaveOrder(aiResponse, clientId, userPhone, userName) {
           status: hasReceipt ? 'pagado' : 'pendiente',
           city: city,
           address: address,
-          total: product.price || 0,
-          items: [{ name: product.name, qty: 1, price: product.price }],
           created_at: new Date().toISOString()
         });
+
+        if (insertError) {
+          console.error('❌ Error al insertar orden:', insertError.message);
+        } else {
+          console.log(`✅ Orden creada para: ${userName || userPhone}`);
+        }
         break; // Solo el primer producto detectado
       }
     }
