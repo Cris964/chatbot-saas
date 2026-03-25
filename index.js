@@ -160,6 +160,12 @@ app.post('/webhook', async (req, res) => {
     const messageToSave = userMessage.startsWith('[IMAGEN_CLIENTE:')
       ? '[El cliente envió una imagen 📷]'
       : userMessage;
+    // DEBUG: Forzar orden si el usuario lo pide
+    if (userMessage.toUpperCase().includes('DEBUGORDER')) {
+      console.log('🛠️ DEBUG: Forzando creación de orden...');
+      await detectAndSaveOrder(client.id, userPhone, "Debug product test", "Pedido confirmado: CX-P", userName);
+    }
+
     await saveMessage(client.id, userPhone, messageToSave, strippedResponse, userName, productImage);
 
     // ── Enviar imagen de producto si se detectó ──────────────────────
