@@ -441,7 +441,8 @@ async function saveMessage(clientId, userPhone, userMessage, aiResponse, userNam
           user_phone: userPhone,
           messages: updated,
           updated_at: new Date().toISOString(),
-          user_name: nameToSave
+          user_name: nameToSave,
+          assigned_to: clientId // Autoprotect: asignar al tenant
         });
     }
   } catch (error) {
