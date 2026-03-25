@@ -388,12 +388,14 @@ async function saveMessage(clientId, userPhone, userMessage, aiResponse, userNam
 
     const history = existing?.messages || [];
 
+    const timestamp = new Date().toISOString();
+
     // Mensajes nuevos — solo agregar respuesta IA si existe
     const newMsgs = [
-      { role: 'user', content: userMessage }
+      { role: 'user', content: userMessage, timestamp }
     ];
     if (aiResponse) {
-      newMsgs.push({ role: 'assistant', content: aiResponse });
+      newMsgs.push({ role: 'assistant', content: aiResponse, timestamp });
     }
 
     // Si se envió una imagen, agregar marcador invisible al historial
